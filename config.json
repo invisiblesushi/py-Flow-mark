@@ -1,0 +1,23 @@
+{
+  "input_folder": "",
+  "output_folder": "",
+  "max_workers": 20,
+  "jpeg_quality": 98,
+
+  "text": {
+    "enabled": true,
+    "content": "",
+    "font_size_percent": 3.0,
+    "padding": 25,
+    "margin": 10
+  },
+
+  "sticker": {
+    "enabled": false,
+    "path": "sticker.png",
+    "size_percent": 20,
+    "position": "right",
+    "padding": 25,
+    "margin": 10
+  }
+}
