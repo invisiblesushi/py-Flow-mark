@@ -31,22 +31,42 @@ DEFAULT_CONFIG = {
     "text": {
         "enabled": True,
         "content": "",
-        "font_size_percent": 3.0,
-        "position": "bottom-middle",
-        "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+        "landscape": {
+            "font_size_percent": 3.0,
+            "position": "bottom-middle",
+            "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+            "opacity": 100,
+        },
+        "portrait": {
+            "font_size_percent": 3.0,
+            "position": "bottom-middle",
+            "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+            "opacity": 100,
+        },
     },
     "sticker": {
         "enabled": False,
         "path": "Sticker.png",
-        "size_percent": 15,
-        "position": "bottom-right",
-        "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+        "landscape": {
+            "size_percent": 15,
+            "position": "bottom-right",
+            "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+            "opacity": 100,
+        },
+        "portrait": {
+            "size_percent": 15,
+            "position": "bottom-right",
+            "padding": {"top": 35, "right": 35, "bottom": 35, "left": 35},
+            "opacity": 100,
+        },
     },
     "cloud_upload": {
         "enabled": False,
         "provider": "pixeldrain",
         "api_key": "",
         "max_workers": 10,
+        "album_mode": "new",
+        "album_id": "",
     },
 }
 
@@ -185,23 +205,72 @@ def _normalize_resize_config(config):
     return config
 
 
+ORIENTATIONS = ("landscape", "portrait")
+
+# Per-orientation layout keys for each watermark section. Everything else in the
+# section (enabled, content, path) is shared by both orientations.
+LAYOUT_KEYS = {
+    "text": ("font_size_percent", "position", "padding", "opacity"),
+    "sticker": ("size_percent", "position", "padding", "opacity"),
+}
+
+
+def image_orientation(width, height):
+    """'portrait' when taller than wide, otherwise 'landscape' (squares count as landscape)."""
+    return "portrait" if height > width else "landscape"
+
+
+def normalize_opacity(value, default=100):
+    """Clamp opacity to an int percentage 0-100."""
+    try:
+        return max(0, min(100, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_layout(section, layout, pad_default=35):
+    """Normalize one orientation's layout dict (padding TRBL, legacy margin, opacity)."""
+    layout = dict(layout or {})
+    pad = normalize_trbl(layout.get("padding", pad_default), pad_default)
+    if "margin" in layout:
+        mar = normalize_trbl(layout.pop("margin"), 0)
+        pad = {s: pad[s] + mar[s] for s in ("top", "right", "bottom", "left")}
+    layout["padding"] = pad
+    layout["opacity"] = normalize_opacity(layout.get("opacity", 100))
+    defaults = DEFAULT_CONFIG[section]["landscape"]
+    for key in LAYOUT_KEYS[section]:
+        layout.setdefault(key, copy.deepcopy(defaults[key]))
+    return layout
+
+
 def _normalize_box_fields(config):
-    """Ensure text/sticker padding is TRBL; fold legacy margin into padding."""
-    for section, pad_default in (
-        ("text", 35),
-        ("sticker", 35),
-    ):
+    """
+    Ensure text/sticker have landscape/portrait layout blocks.
+    Legacy flat keys (font_size_percent/size_percent, position, padding, margin)
+    are copied into both orientations.
+    """
+    for section in ("text", "sticker"):
         block = config.get(section)
         if not isinstance(block, dict):
             continue
-        pad = normalize_trbl(block.get("padding", pad_default), pad_default)
-        if "margin" in block:
-            mar = normalize_trbl(block.get("margin"), 0)
-            pad = {s: pad[s] + mar[s] for s in ("top", "right", "bottom", "left")}
-            block.pop("margin", None)
-        block["padding"] = pad
-        block.pop("margin", None)
+        legacy = {}
+        for key in LAYOUT_KEYS[section] + ("margin",):
+            if key in block:
+                legacy[key] = block.pop(key)
+        for orientation in ORIENTATIONS:
+            layout = dict(block.get(orientation) or {})
+            layout.update(copy.deepcopy(legacy))
+            block[orientation] = _normalize_layout(section, layout)
     return config
+
+
+def watermark_settings(config, section, orientation):
+    """Flat settings for one section/orientation: shared keys + that orientation's layout."""
+    block = dict((config or {}).get(section) or {})
+    layouts = {o: block.pop(o, None) for o in ORIENTATIONS}
+    layout = layouts.get(orientation) or layouts.get("landscape") or {}
+    # Legacy flat configs (not run through load_config) keep working.
+    return {**block, **layout}
 
 
 def load_config(path=None):
@@ -231,6 +300,10 @@ def load_config(path=None):
     cloud = config.get("cloud_upload")
     if isinstance(cloud, dict):
         cloud.pop("album_name", None)
+        mode = str(cloud.get("album_mode") or "new").strip().lower()
+        cloud["album_mode"] = mode if mode in ("new", "existing") else "new"
+        album_id = cloud.get("album_id")
+        cloud["album_id"] = album_id.strip() if isinstance(album_id, str) else ""
     return config
 
 

@@ -9,7 +9,10 @@ from pathlib import Path
 from .exceptions import CloudUploadError
 from .pixeldrain import (
     DEFAULT_UPLOAD_WORKERS,
+    MIN_ALBUM_ID_LEN,
     create_album_pixeldrain,
+    get_album,
+    parse_album_id,
     upload_file_pixeldrain,
     upload_folder_to_pixeldrain,
 )
@@ -17,8 +20,11 @@ from .pixeldrain import (
 __all__ = [
     "CloudUploadError",
     "DEFAULT_UPLOAD_WORKERS",
+    "MIN_ALBUM_ID_LEN",
     "create_album_pixeldrain",
+    "get_album",
     "maybe_cloud_upload",
+    "parse_album_id",
     "upload_file_pixeldrain",
     "upload_folder_to_pixeldrain",
 ]
@@ -40,6 +46,15 @@ def maybe_cloud_upload(output_files, config, progress_callback=None):
         input_folder = ((config or {}).get("input_folder") or "").strip()
         album_name = Path(input_folder).name if input_folder else ""
 
+    album_mode = str(cloud.get("album_mode") or "new").strip().lower()
+    album_id = (cloud.get("album_id") or "").strip()
+    if album_mode != "existing":
+        album_id = ""
+    elif not album_id:
+        raise CloudUploadError(
+            "Album ID is required when uploading to an existing album"
+        )
+
     if provider == "pixeldrain":
         result = upload_folder_to_pixeldrain(
             output_files,
@@ -47,6 +62,7 @@ def maybe_cloud_upload(output_files, config, progress_callback=None):
             album_name=album_name,
             progress_callback=progress_callback,
             max_workers=cloud.get("max_workers", DEFAULT_UPLOAD_WORKERS),
+            album_id=album_id,
         )
         return result.get("album_url")
 

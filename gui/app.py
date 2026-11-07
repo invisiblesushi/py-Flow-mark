@@ -1,5 +1,6 @@
 """FlowMark GUI — CustomTkinter app with live preview."""
 
+import copy
 import os
 import threading
 from pathlib import Path
@@ -11,18 +12,27 @@ import flowmark
 from flowmark import (
     CONFIG_PATH,
     DEFAULT_CONFIG,
+    LAYOUT_KEYS,
+    ORIENTATIONS,
     apply_watermarks,
-    combine_trbl,
     default_workers,
     estimate_export_savings,
     export_resize_label,
     format_savings_estimate,
     load_config,
+    normalize_opacity,
     normalize_position,
     normalize_trbl,
     process_folder,
     resize_image,
     save_config,
+    watermark_settings,
+)
+from flowmark.cloud import (
+    MIN_ALBUM_ID_LEN,
+    CloudUploadError,
+    get_album,
+    parse_album_id,
 )
 
 from .preview import find_folder_preview_images, fit_for_display, make_placeholder
@@ -32,6 +42,7 @@ from .theme import (
     BG,
     BORDER,
     CARD,
+    DANGER,
     DEBOUNCE_MS,
     ESTIMATE_DEBOUNCE_MS,
     MUTED,
@@ -63,6 +74,9 @@ class FlowMarkApp(ctk.CTk):
         self._running = False
         self._output_user_edited = False
         self._log_visible = False
+        self._album_check_job = None
+        self._album_check_token = 0
+        self._album_verified_id = None
         self._last_preview_rgba = None
         self._preview_source_note = ""
         self.var_preview_tab = ctk.StringVar(value="Landscape")
@@ -93,13 +107,25 @@ class FlowMarkApp(ctk.CTk):
         self.var_font_pct = ctk.DoubleVar(value=3.0)
         self.var_text_pos = ctk.StringVar(value="bottom-middle")
         self.var_text_padding = {s: ctk.IntVar(value=35) for s in TRBL_SIDES}
+        self.var_text_opacity = ctk.IntVar(value=100)
         self.var_sticker_enabled = ctk.BooleanVar(value=False)
         self.var_sticker_path = ctk.StringVar(value="Sticker.png")
         self.var_sticker_pct = ctk.DoubleVar(value=15.0)
         self.var_sticker_pos = ctk.StringVar(value="bottom-right")
         self.var_sticker_padding = {s: ctk.IntVar(value=35) for s in TRBL_SIDES}
+        self.var_sticker_opacity = ctk.IntVar(value=100)
+        # Layout (size/position/padding/opacity) is stored per orientation; the vars
+        # above always show the orientation selected in var_preview_tab.
+        self._layout_orientation = "landscape"
+        self._layouts = {
+            o: {sec: copy.deepcopy(DEFAULT_CONFIG[sec][o]) for sec in LAYOUT_KEYS}
+            for o in ORIENTATIONS
+        }
+        self._copy_layout_buttons = []
         self.var_cloud_enabled = ctk.BooleanVar(value=False)
+        self.var_cloud_album_mode = ctk.StringVar(value="Create new album")
         self.var_cloud_album = ctk.StringVar(value="")
+        self.var_cloud_album_id = ctk.StringVar(value="")
         self.var_cloud_api_key = ctk.StringVar(value="")
         self.var_cloud_workers = ctk.IntVar(value=10)
         self.var_export_status = ctk.StringVar(value="Export: original size")
@@ -110,7 +136,7 @@ class FlowMarkApp(ctk.CTk):
         preview_vars = [
             self.var_text_enabled, self.var_text_content, self.var_font_pct, self.var_text_pos,
             self.var_sticker_enabled, self.var_sticker_path, self.var_sticker_pct,
-            self.var_sticker_pos,
+            self.var_sticker_pos, self.var_text_opacity, self.var_sticker_opacity,
         ]
         for group in (self.var_text_padding, self.var_sticker_padding):
             preview_vars.extend(group.values())
@@ -124,6 +150,7 @@ class FlowMarkApp(ctk.CTk):
         for var in export_vars:
             var.trace_add("write", self._on_export_settings_change)
 
+        self.var_preview_tab.trace_add("write", self._on_orientation_change)
         self.var_input.trace_add("write", self._on_input_change)
         self.var_output.trace_add("write", self._on_output_change)
 
@@ -271,32 +298,44 @@ class FlowMarkApp(ctk.CTk):
             acc.body, textvariable=self.var_text_content, placeholder_text="Watermark text",
             height=34, corner_radius=8,
         ).pack(fill="x", pady=(0, 8))
+        dt = d["text"]["landscape"]
+        self._orientation_row(acc.body, "text")
         self._labeled_slider(
             acc.body, "Font size %", self.var_font_pct, 0.5, 20, 0.1,
-            default=d["text"]["font_size_percent"],
+            default=dt["font_size_percent"],
+        )
+        self._labeled_slider(
+            acc.body, "Opacity %", self.var_text_opacity, 0, 100, 1,
+            default=dt["opacity"],
         )
         self._option_header(
             acc.body, "Position",
-            lambda: self.var_text_pos.set(d["text"].get("position", "bottom-middle")),
+            lambda: self.var_text_pos.set(dt.get("position", "bottom-middle")),
         )
         PositionGrid(acc.body, self.var_text_pos, command=self.schedule_preview).pack(anchor="w")
-        self._trbl_row(acc.body, "Padding", self.var_text_padding, default=d["text"]["padding"])
+        self._trbl_row(acc.body, "Padding", self.var_text_padding, default=dt["padding"])
 
         acc = Accordion(parent, "Sticker / Logo", expanded=True)
         acc.pack(fill="x", pady=(0, 10))
         self._enable_switch(acc.body, self.var_sticker_enabled).pack(anchor="w", pady=(0, 8))
         self._option_header(acc.body, "PNG path", lambda: self.var_sticker_path.set(d["sticker"]["path"]))
         PathChip(acc.body, self.var_sticker_path, self._browse_sticker).pack(fill="x", pady=(0, 8))
+        ds = d["sticker"]["landscape"]
+        self._orientation_row(acc.body, "sticker")
         self._labeled_slider(
             acc.body, "Size %", self.var_sticker_pct, 1, 100, 0.5,
-            default=d["sticker"]["size_percent"],
+            default=ds["size_percent"],
+        )
+        self._labeled_slider(
+            acc.body, "Opacity %", self.var_sticker_opacity, 0, 100, 1,
+            default=ds["opacity"],
         )
         self._option_header(
             acc.body, "Position",
-            lambda: self.var_sticker_pos.set(d["sticker"]["position"]),
+            lambda: self.var_sticker_pos.set(ds["position"]),
         )
         PositionGrid(acc.body, self.var_sticker_pos, command=self.schedule_preview).pack(anchor="w")
-        self._trbl_row(acc.body, "Padding", self.var_sticker_padding, default=d["sticker"]["padding"])
+        self._trbl_row(acc.body, "Padding", self.var_sticker_padding, default=ds["padding"])
 
         # Cloud upload (Pixeldrain)
         cloud_d = d.get("cloud_upload") or {}
@@ -305,17 +344,63 @@ class FlowMarkApp(ctk.CTk):
         self._enable_switch(acc.body, self.var_cloud_enabled).pack(anchor="w", pady=(0, 8))
 
         self.cloud_options = ctk.CTkFrame(acc.body, fg_color="transparent")
+        self.album_mode_seg = ctk.CTkSegmentedButton(
+            self.cloud_options,
+            values=["Create new album", "Upload to existing"],
+            variable=self.var_cloud_album_mode,
+            command=self._sync_album_mode,
+            font=ctk.CTkFont(size=12),
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=PANEL,
+            unselected_hover_color=BORDER,
+        )
+        self.album_mode_seg.pack(fill="x", pady=(0, 8))
+
+        self.album_target = ctk.CTkFrame(self.cloud_options, fg_color="transparent")
+        self.album_target.pack(fill="x")
+
+        self.album_name_block = ctk.CTkFrame(self.album_target, fg_color="transparent")
+        self.album_name_block.pack(fill="x")
         self._option_header(
-            self.cloud_options, "Album name",
+            self.album_name_block, "Album name",
             lambda: self.var_cloud_album.set(self._default_album_for(self.var_input.get())),
         )
         ctk.CTkEntry(
-            self.cloud_options,
+            self.album_name_block,
             textvariable=self.var_cloud_album,
             placeholder_text="Defaults to input folder name",
             height=34,
             corner_radius=8,
         ).pack(fill="x", pady=(0, 8))
+
+        self.album_id_block = ctk.CTkFrame(self.album_target, fg_color="transparent")
+        self._option_header(
+            self.album_id_block, "Album ID",
+            lambda: self.var_cloud_album_id.set(""),
+        )
+        id_row = ctk.CTkFrame(self.album_id_block, fg_color="transparent")
+        id_row.pack(fill="x", pady=(0, 8))
+        ctk.CTkEntry(
+            id_row,
+            textvariable=self.var_cloud_album_id,
+            placeholder_text="List ID or pixeldrain.com/l/…",
+            height=34,
+            corner_radius=8,
+        ).pack(side="left", fill="x", expand=True)
+        self.lbl_album_status = ctk.CTkLabel(
+            id_row,
+            text="",
+            width=130,
+            anchor="w",
+            justify="left",
+            wraplength=130,
+            text_color=SUCCESS,
+            font=ctk.CTkFont(size=12),
+        )
+        self.lbl_album_status.pack(side="left", padx=(10, 0))
+        self.var_cloud_album_id.trace_add("write", self._on_album_id_edited)
+        self.var_cloud_api_key.trace_add("write", self._on_album_key_edited)
         self._option_header(
             self.cloud_options, "API key",
             lambda: self.var_cloud_api_key.set(cloud_d.get("api_key") or ""),
@@ -360,6 +445,99 @@ class FlowMarkApp(ctk.CTk):
         self.var_cloud_enabled.trace_add("write", self._sync_cloud_options)
         self._sync_cloud_options()
 
+    def _orientation_row(self, parent, section):
+        """Landscape/Portrait selector (shared with the preview tab) + copy button."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=(4, 6))
+        ctk.CTkLabel(row, text="Layout for", text_color=MUTED).pack(side="left", padx=(0, 8))
+        ctk.CTkSegmentedButton(
+            row,
+            values=["Landscape", "Portrait"],
+            variable=self.var_preview_tab,
+            font=ctk.CTkFont(size=12),
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=PANEL,
+            unselected_hover_color=BORDER,
+        ).pack(side="left")
+        btn = ctk.CTkButton(
+            row,
+            text=self._copy_layout_label(),
+            width=120,
+            height=24,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=BORDER,
+            border_width=1,
+            border_color=BORDER,
+            text_color=MUTED,
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._copy_layout_to_other(section),
+        )
+        btn.pack(side="right")
+        self._copy_layout_buttons.append(btn)
+
+    def _other_orientation(self):
+        return "portrait" if self._layout_orientation == "landscape" else "landscape"
+
+    def _copy_layout_label(self):
+        return f"Copy to {self._other_orientation()}"
+
+    def _copy_layout_to_other(self, section):
+        self._commit_layout_vars()
+        other = self._other_orientation()
+        self._layouts[other][section] = copy.deepcopy(self._layouts[self._layout_orientation][section])
+        name = "Text" if section == "text" else "Sticker"
+        self.var_status.set(f"{name} layout copied to {other}")
+
+    def _read_layout_vars(self):
+        """Current layout controls -> {"text": {...}, "sticker": {...}}."""
+        return {
+            "text": {
+                "font_size_percent": float(self.var_font_pct.get()),
+                "position": normalize_position(self.var_text_pos.get()) or "bottom-middle",
+                "padding": self._trbl_from_vars(self.var_text_padding),
+                "opacity": normalize_opacity(self.var_text_opacity.get()),
+            },
+            "sticker": {
+                "size_percent": float(self.var_sticker_pct.get()),
+                "position": normalize_position(self.var_sticker_pos.get()) or "bottom-right",
+                "padding": self._trbl_from_vars(self.var_sticker_padding),
+                "opacity": normalize_opacity(self.var_sticker_opacity.get()),
+            },
+        }
+
+    def _write_layout_vars(self, layout):
+        t = layout["text"]
+        self.var_font_pct.set(float(t["font_size_percent"]))
+        self.var_text_pos.set(normalize_position(t["position"]) or "bottom-middle")
+        self._set_trbl_vars(self.var_text_padding, t["padding"])
+        self.var_text_opacity.set(normalize_opacity(t["opacity"]))
+        st = layout["sticker"]
+        self.var_sticker_pct.set(float(st["size_percent"]))
+        self.var_sticker_pos.set(normalize_position(st["position"]) or "bottom-right")
+        self._set_trbl_vars(self.var_sticker_padding, st["padding"])
+        self.var_sticker_opacity.set(normalize_opacity(st["opacity"]))
+
+    def _commit_layout_vars(self):
+        """Store the controls' values under the orientation they are showing."""
+        try:
+            self._layouts[self._layout_orientation] = self._read_layout_vars()
+        except Exception:
+            pass
+
+    def _on_orientation_change(self, *_):
+        tab = (self.var_preview_tab.get() or "Landscape").strip().lower()
+        new = "portrait" if tab.startswith("portrait") else "landscape"
+        if new != self._layout_orientation:
+            self._commit_layout_vars()
+            self._layout_orientation = new
+            self._write_layout_vars(self._layouts[new])
+            for btn in self._copy_layout_buttons:
+                btn.configure(text=self._copy_layout_label())
+        self._last_preview_rgba = None
+        self.schedule_preview()
+
     def _enable_switch(self, parent, variable):
         """Switch whose label is Enable when on, Disable when off."""
         switch = ctk.CTkSwitch(
@@ -384,8 +562,130 @@ class FlowMarkApp(ctk.CTk):
         if self.var_cloud_enabled.get():
             if not self.cloud_options.winfo_ismapped():
                 self.cloud_options.pack(fill="x")
+            self._schedule_album_check()
         else:
             self.cloud_options.pack_forget()
+            self._cancel_album_check()
+
+    def _album_mode_is_existing(self):
+        return self.var_cloud_album_mode.get() == "Upload to existing"
+
+    def _sync_album_mode(self, *_value):
+        """Show the album name or the album ID box for the selected mode."""
+        if not hasattr(self, "album_name_block"):
+            return
+        if self._album_mode_is_existing():
+            if self.album_name_block.winfo_ismapped():
+                self.album_name_block.pack_forget()
+            if not self.album_id_block.winfo_ismapped():
+                self.album_id_block.pack(fill="x")
+        else:
+            if self.album_id_block.winfo_ismapped():
+                self.album_id_block.pack_forget()
+            if not self.album_name_block.winfo_ismapped():
+                self.album_name_block.pack(fill="x")
+        self._schedule_album_check()
+
+    def _set_album_status(self, text, color=MUTED):
+        if hasattr(self, "lbl_album_status"):
+            self.lbl_album_status.configure(text=text, text_color=color)
+
+    def _album_id_ready(self, raw):
+        """Return (album_id, error). album_id is set once the value is long enough to look up."""
+        raw = (raw or "").strip()
+        if not raw:
+            return None, None
+        looks_like_url = "://" in raw or "pixeldrain.com" in raw.lower()
+        try:
+            album_id = parse_album_id(raw)
+        except CloudUploadError:
+            if looks_like_url or len(raw) < MIN_ALBUM_ID_LEN:
+                return None, None
+            return None, "Not a valid album ID"
+        if len(album_id) < MIN_ALBUM_ID_LEN:
+            return None, None
+        return album_id, None
+
+    def _album_status_message(self, exc):
+        text = str(exc).strip() or "Not found"
+        lower = text.lower()
+        if "404" in text or "not found" in lower or "could not be found" in lower:
+            return "Not found"
+        if text.startswith("Network error"):
+            return "Network error"
+        if text.startswith("HTTP "):
+            detail = text.split(": ", 1)[1] if ": " in text else text
+            text = detail
+        if len(text) > 32:
+            return text[:29] + "…"
+        return text
+
+    def _cancel_album_check(self):
+        if self._album_check_job is not None:
+            try:
+                self.after_cancel(self._album_check_job)
+            except Exception:
+                pass
+            self._album_check_job = None
+        self._album_check_token += 1
+
+    def _schedule_album_check(self):
+        self._cancel_album_check()
+        if not self.var_cloud_enabled.get() or not self._album_mode_is_existing():
+            return
+        token = self._album_check_token
+        self._album_check_job = self.after(400, lambda t=token: self._run_album_check(t))
+
+    def _on_album_id_edited(self, *_):
+        self._album_verified_id = None
+        self._set_album_status("")
+        self._schedule_album_check()
+
+    def _on_album_key_edited(self, *_):
+        if not hasattr(self, "lbl_album_status"):
+            return
+        self._schedule_album_check()
+
+    def _run_album_check(self, token):
+        self._album_check_job = None
+        if token != self._album_check_token or not self.winfo_exists():
+            return
+        album_id, error = self._album_id_ready(self.var_cloud_album_id.get())
+        if error:
+            self._album_verified_id = None
+            self._set_album_status(error, DANGER)
+            return
+        if not album_id:
+            self._set_album_status("")
+            return
+        self._set_album_status("Checking…", MUTED)
+        api_key = self.var_cloud_api_key.get().strip()
+
+        def work():
+            try:
+                get_album(api_key, album_id)
+                outcome = (True, album_id, "Album exists")
+            except Exception as exc:
+                outcome = (False, album_id, self._album_status_message(exc))
+            self.after(0, lambda outcome=outcome: self._album_check_done(token, outcome))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _album_check_done(self, token, outcome):
+        if token != self._album_check_token or not self.winfo_exists():
+            return
+        if not self._album_mode_is_existing():
+            return
+        ok, album_id, message = outcome
+        current, _error = self._album_id_ready(self.var_cloud_album_id.get())
+        if current != album_id:
+            return
+        if ok:
+            self._album_verified_id = album_id
+            self._set_album_status("Album exists", SUCCESS)
+        else:
+            self._album_verified_id = None
+            self._set_album_status(message, DANGER)
 
     def _reset_btn(self, parent, command):
         return ctk.CTkButton(
@@ -551,7 +851,6 @@ class FlowMarkApp(ctk.CTk):
             top,
             values=["Landscape", "Portrait"],
             variable=self.var_preview_tab,
-            command=self._on_preview_tab,
             selected_color=ACCENT,
             selected_hover_color=ACCENT_HOVER,
             unselected_color=PANEL,
@@ -628,12 +927,6 @@ class FlowMarkApp(ctk.CTk):
         else:
             self.log_frame.pack_forget()
             self.btn_log.configure(text="▾ Log")
-
-    def _on_preview_tab(self, value=None):
-        if value:
-            self.var_preview_tab.set(value)
-        self._last_preview_rgba = None
-        self.refresh_preview()
 
     def _on_preview_scale(self, value):
         pct = int(round(float(value)))
@@ -775,6 +1068,8 @@ class FlowMarkApp(ctk.CTk):
         self._preview_source_note = "Preview: " + " · ".join(notes)
 
     def form_to_config(self):
+        self._commit_layout_vars()
+        layouts = copy.deepcopy(self._layouts)
         return {
             "input_folder": self.var_input.get().strip(),
             "output_folder": self.var_output.get().strip(),
@@ -789,22 +1084,20 @@ class FlowMarkApp(ctk.CTk):
             "text": {
                 "enabled": bool(self.var_text_enabled.get()),
                 "content": self.var_text_content.get(),
-                "font_size_percent": float(self.var_font_pct.get()),
-                "position": normalize_position(self.var_text_pos.get()) or "bottom-middle",
-                "padding": self._trbl_from_vars(self.var_text_padding),
+                **{o: layouts[o]["text"] for o in ORIENTATIONS},
             },
             "sticker": {
                 "enabled": bool(self.var_sticker_enabled.get()),
                 "path": self.var_sticker_path.get().strip(),
-                "size_percent": float(self.var_sticker_pct.get()),
-                "position": normalize_position(self.var_sticker_pos.get()) or "bottom-right",
-                "padding": self._trbl_from_vars(self.var_sticker_padding),
+                **{o: layouts[o]["sticker"] for o in ORIENTATIONS},
             },
             "cloud_upload": {
                 "enabled": bool(self.var_cloud_enabled.get()),
                 "provider": "pixeldrain",
                 "api_key": self.var_cloud_api_key.get().strip(),
                 "album_name": self.var_cloud_album.get().strip(),
+                "album_mode": "existing" if self._album_mode_is_existing() else "new",
+                "album_id": self.var_cloud_album_id.get().strip(),
                 "max_workers": self._cloud_workers_from_form(),
             },
         }
@@ -855,35 +1148,36 @@ class FlowMarkApp(ctk.CTk):
         text = config.get("text") or {}
         self.var_text_enabled.set(bool(text.get("enabled", True)))
         self.var_text_content.set(text.get("content") or "")
-        self.var_font_pct.set(float(text.get("font_size_percent", 3.0)))
-        self.var_text_pos.set(
-            normalize_position(text.get("position") or "bottom-middle") or "bottom-middle"
-        )
-        pad = text.get("padding", 35)
-        if "margin" in text:
-            pad = combine_trbl(pad, text.get("margin"))
-        self._set_trbl_vars(self.var_text_padding, pad)
 
         sticker = config.get("sticker") or {}
         self.var_sticker_enabled.set(bool(sticker.get("enabled", False)))
         self.var_sticker_path.set(sticker.get("path") or "Sticker.png")
-        self.var_sticker_pct.set(float(sticker.get("size_percent", 15)))
-        pos = normalize_position(sticker.get("position") or "bottom-right") or "bottom-right"
-        self.var_sticker_pos.set(pos)
-        spad = sticker.get("padding", 35)
-        if "margin" in sticker:
-            spad = combine_trbl(spad, sticker.get("margin"))
-        self._set_trbl_vars(self.var_sticker_padding, spad)
+
+        for orientation in ORIENTATIONS:
+            for section, keys in LAYOUT_KEYS.items():
+                settings = watermark_settings(config, section, orientation)
+                defaults = DEFAULT_CONFIG[section][orientation]
+                layout = {k: copy.deepcopy(settings.get(k, defaults[k])) for k in keys}
+                layout["padding"] = normalize_trbl(layout["padding"], 35)
+                layout["opacity"] = normalize_opacity(layout["opacity"])
+                self._layouts[orientation][section] = layout
+        self._write_layout_vars(self._layouts[self._layout_orientation])
 
         cloud = config.get("cloud_upload") or {}
         self.var_cloud_enabled.set(bool(cloud.get("enabled", False)))
+        mode = str(cloud.get("album_mode") or "new").strip().lower()
+        self.var_cloud_album_mode.set(
+            "Upload to existing" if mode == "existing" else "Create new album"
+        )
         # Album name is not persisted; always default to the input folder name.
         self.var_cloud_album.set(self._default_album_for(self.var_input.get()))
+        self.var_cloud_album_id.set(cloud.get("album_id") or "")
         self.var_cloud_api_key.set(cloud.get("api_key") or "")
         try:
             self.var_cloud_workers.set(max(1, min(32, int(cloud.get("max_workers") or 10))))
         except (TypeError, ValueError):
             self.var_cloud_workers.set(10)
+        self._sync_album_mode()
         self._sync_cloud_options()
 
         self.reload_preview_bases()
@@ -1076,6 +1370,25 @@ class FlowMarkApp(ctk.CTk):
                 "Cloud upload is enabled but no Pixeldrain API key is set.",
             )
             return
+        if cloud.get("enabled") and str(cloud.get("album_mode") or "new").lower() == "existing":
+            raw_id = (cloud.get("album_id") or "").strip()
+            if not raw_id:
+                messagebox.showerror(
+                    "Cloud upload",
+                    "Enter an album ID to upload to an existing album.",
+                )
+                return
+            try:
+                album_id = parse_album_id(raw_id)
+            except CloudUploadError as exc:
+                messagebox.showerror("Cloud upload", str(exc))
+                return
+            if len(album_id) < MIN_ALBUM_ID_LEN or self._album_verified_id != album_id:
+                messagebox.showerror(
+                    "Cloud upload",
+                    "Album ID must match an existing album before uploading.",
+                )
+                return
 
         try:
             save_config(config)

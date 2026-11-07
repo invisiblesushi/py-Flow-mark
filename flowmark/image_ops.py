@@ -2,7 +2,16 @@
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .config import SUBSAMPLING_MAP, normalize_position, normalize_trbl, combine_trbl, resolve_path
+from .config import (
+    SUBSAMPLING_MAP,
+    combine_trbl,
+    image_orientation,
+    normalize_opacity,
+    normalize_position,
+    normalize_trbl,
+    resolve_path,
+    watermark_settings,
+)
 
 
 def _sizing_base(image):
@@ -70,9 +79,14 @@ def anchor_xy(container_w, container_h, item_w, item_h, position, inset):
     return x, y, item_w, item_h
 
 
+def _alpha_from_opacity(opacity):
+    """Opacity percent (0-100) to an 8-bit alpha value."""
+    return int(round(255 * normalize_opacity(opacity) / 100.0))
+
+
 def add_text_watermark(image, text="", font_size_percent=3.0, position="bottom-middle",
-                       padding=35, margin=None):
-    """Add a text watermark at a 3x3 grid position."""
+                       padding=35, margin=None, opacity=100):
+    """Add a text watermark at a 3x3 grid position. opacity is 0-100%."""
     if not text:
         return image
 
@@ -95,13 +109,13 @@ def add_text_watermark(image, text="", font_size_percent=3.0, position="bottom-m
         image.width, image.height, text_width, text_height, position, inset,
     )
 
-    draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
+    draw.text((x, y), text, fill=(255, 255, 255, _alpha_from_opacity(opacity)), font=font)
     return Image.alpha_composite(image.convert("RGBA"), watermark_layer)
 
 
 def add_sticker_watermark(image, sticker_path, size_percent=15, position="bottom-right",
-                          padding=35, margin=None):
-    """Add a PNG sticker at a 3x3 grid position using TRBL padding."""
+                          padding=35, margin=None, opacity=100):
+    """Add a PNG sticker at a 3x3 grid position using TRBL padding. opacity is 0-100%."""
     sticker = Image.open(sticker_path).convert("RGBA")
     inset = combine_trbl(padding, margin)
 
@@ -119,24 +133,32 @@ def add_sticker_watermark(image, sticker_path, size_percent=15, position="bottom
         target_width = min(target_width, content_w)
 
     sticker = sticker.resize((target_width, target_height), Image.Resampling.LANCZOS)
+    opacity = normalize_opacity(opacity)
+    if opacity < 100:
+        alpha = sticker.getchannel("A").point(lambda a: a * opacity // 100)
+        sticker.putalpha(alpha)
 
     x, y, _, _ = anchor_xy(
         image.width, image.height, sticker.width, sticker.height, position, inset,
     )
 
     watermark_layer = Image.new("RGBA", image.size, (255, 255, 255, 0))
-    watermark_layer.paste(sticker, (x, y), sticker)
+    # Layer is fully transparent, so paste RGBA as-is; using the sticker as its own
+    # mask would square its alpha (double-fading soft edges and opacity).
+    watermark_layer.paste(sticker, (x, y))
     return Image.alpha_composite(image.convert("RGBA"), watermark_layer)
 
 
 def apply_watermarks(image, config, sticker_required=False):
     """
     Apply text and/or sticker watermarks from a config dict.
+    Uses the landscape or portrait layout depending on the image's shape.
     Returns (image, warning_message_or_None).
     """
     config = config or {}
-    text_cfg = config.get("text") or {}
-    sticker_cfg = config.get("sticker") or {}
+    orientation = image_orientation(image.width, image.height)
+    text_cfg = watermark_settings(config, "text", orientation)
+    sticker_cfg = watermark_settings(config, "sticker", orientation)
     warning = None
 
     image = image.convert("RGBA")
@@ -149,6 +171,7 @@ def apply_watermarks(image, config, sticker_required=False):
             position=text_cfg.get("position", "bottom-middle"),
             padding=text_cfg.get("padding", 35),
             margin=text_cfg.get("margin"),
+            opacity=text_cfg.get("opacity", 100),
         )
 
     if sticker_cfg.get("enabled", False):
@@ -161,6 +184,7 @@ def apply_watermarks(image, config, sticker_required=False):
                 position=sticker_cfg.get("position", "bottom-right"),
                 padding=sticker_cfg.get("padding", 35),
                 margin=sticker_cfg.get("margin"),
+                opacity=sticker_cfg.get("opacity", 100),
             )
         else:
             warning = f"Sticker not found: {sticker_cfg.get('path') or '(empty)'}"

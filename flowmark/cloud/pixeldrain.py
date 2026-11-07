@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import urllib.error
 import urllib.parse
@@ -16,6 +17,12 @@ from .exceptions import CloudUploadError
 PIXELDRAIN_API = "https://pixeldrain.com/api"
 PIXELDRAIN_LIST_URL = "https://pixeldrain.com/l/{id}"
 DEFAULT_UPLOAD_WORKERS = 10
+MIN_ALBUM_ID_LEN = 6
+_ALBUM_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?pixeldrain\.com/(?:api/list|l)/([A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_ALBUM_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 # #region agent log
@@ -54,10 +61,12 @@ def _basic_auth_header(api_key: str) -> str:
 
 def _request_json(method, url, *, api_key, data=None, content_type=None, timeout=120):
     headers = {
-        "Authorization": _basic_auth_header(api_key),
         "User-Agent": "FlowMark/1.0",
         "Accept": "application/json",
     }
+    api_key = (api_key or "").strip()
+    if api_key:
+        headers["Authorization"] = _basic_auth_header(api_key)
     body = data
     if content_type:
         headers["Content-Type"] = content_type
@@ -149,6 +158,119 @@ def create_album(api_key, title, file_ids):
     return album_id, PIXELDRAIN_LIST_URL.format(id=album_id)
 
 
+def parse_album_id(value):
+    """
+    Return a Pixeldrain list id from a raw id or an album URL.
+
+    Accepts ``https://pixeldrain.com/l/{id}`` and
+    ``https://pixeldrain.com/api/list/{id}``.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        raise CloudUploadError("Album ID is required")
+
+    match = _ALBUM_URL_RE.search(raw)
+    if match:
+        return match.group(1)
+
+    if "://" in raw or "pixeldrain.com" in raw.lower():
+        raise CloudUploadError("Album ID is not valid")
+
+    token = raw.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+    if "/" in token:
+        token = token.rsplit("/", 1)[-1]
+    if not _ALBUM_ID_RE.fullmatch(token):
+        raise CloudUploadError("Album ID is not valid")
+    return token
+
+
+def get_album(api_key, album_ref):
+    """
+    Fetch a Pixeldrain list. The API key is sent when present.
+    Public lists can be read without one.
+    Returns the list payload.
+    """
+    album_id = parse_album_id(album_ref)
+    url = f"{PIXELDRAIN_API}/list/{urllib.parse.quote(album_id, safe='')}"
+    payload = _request_json(
+        "GET",
+        url,
+        api_key=(api_key or "").strip(),
+        timeout=30,
+    )
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise CloudUploadError("Album lookup returned an unexpected response")
+    return payload
+
+
+def _require_editable(payload):
+    if payload.get("can_edit") is False:
+        raise CloudUploadError(
+            "This album cannot be edited with the current API key"
+        )
+
+
+def append_to_album(api_key, album_ref, file_ids):
+    """
+    Add file ids to an existing list.
+
+    PUT /list/{id} replaces the file list, so the current files are read
+    first and sent back ahead of the new ids. The existing title is kept.
+    Returns (album_id, album_url).
+    """
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise CloudUploadError("Pixeldrain API key is required")
+    if not file_ids:
+        raise CloudUploadError("No files to add to the album")
+
+    album_id = parse_album_id(album_ref)
+    existing = get_album(api_key, album_id)
+    _require_editable(existing)
+    album_id = str(existing.get("id") or album_id)
+
+    merged = []
+    seen = set()
+    for item in existing.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        fid = item.get("id")
+        if not fid:
+            continue
+        fid = str(fid)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        entry = {"id": fid}
+        if item.get("description") is not None:
+            entry["description"] = item.get("description")
+        merged.append(entry)
+
+    for fid in file_ids:
+        fid = str(fid)
+        if fid in seen:
+            continue
+        seen.add(fid)
+        merged.append({"id": fid})
+
+    if not merged:
+        raise CloudUploadError("No files to add to the album")
+
+    body = {"files": merged}
+    title = (existing.get("title") or "").strip()
+    if title:
+        body["title"] = title
+
+    _request_json(
+        "PUT",
+        f"{PIXELDRAIN_API}/list/{urllib.parse.quote(album_id, safe='')}",
+        api_key=api_key,
+        data=body,
+        timeout=60,
+    )
+    return album_id, PIXELDRAIN_LIST_URL.format(id=album_id)
+
+
 def _clamp_workers(value, fallback=DEFAULT_UPLOAD_WORKERS):
     try:
         n = int(value)
@@ -158,17 +280,25 @@ def _clamp_workers(value, fallback=DEFAULT_UPLOAD_WORKERS):
 
 
 def upload_folder(files, api_key, album_name, progress_callback=None,
-                  max_workers=DEFAULT_UPLOAD_WORKERS):
+                  max_workers=DEFAULT_UPLOAD_WORKERS, album_id=None):
     """
-    Upload files concurrently and create an album.
+    Upload files concurrently and create an album, or append to one.
 
     files: iterable of Path / str
+    album_id: existing Pixeldrain list id or album URL. Empty creates a new list.
     max_workers: parallel upload threads (clamped 1–32)
     Returns dict: {album_id, album_url, file_ids, uploaded, failed}
     """
     api_key = (api_key or "").strip()
     if not api_key:
         raise CloudUploadError("Pixeldrain API key is required for cloud upload")
+
+    target_id = (album_id or "").strip()
+    if target_id:
+        target_id = parse_album_id(target_id)
+        existing = get_album(api_key, target_id)
+        _require_editable(existing)
+        target_id = str(existing.get("id") or target_id)
 
     paths = [Path(p) for p in files]
     paths = [p for p in paths if p.is_file()]
@@ -259,10 +389,16 @@ def upload_folder(files, api_key, album_name, progress_callback=None,
     # #endregion
 
     if not file_ids:
+        if target_id:
+            raise CloudUploadError("All uploads failed; album not updated")
         raise CloudUploadError("All uploads failed; album not created")
 
-    album_id, album_url = create_album(api_key, album_name, file_ids)
-    log(f"☁️ Album created: {album_url}")
+    if target_id:
+        album_id, album_url = append_to_album(api_key, target_id, file_ids)
+        log(f"☁️ Added {len(file_ids)} file(s) to album: {album_url}")
+    else:
+        album_id, album_url = create_album(api_key, album_name, file_ids)
+        log(f"☁️ Album created: {album_url}")
     if failed:
         log(f"☁️ Warning: {len(failed)} file(s) failed to upload")
 

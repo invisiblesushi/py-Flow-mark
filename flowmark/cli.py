@@ -33,7 +33,8 @@ def _prompt_sticker_options(sticker_cfg):
             break
         print("❌ Please provide a valid PNG file path.")
 
-    default_size = sticker_cfg.get("size_percent", 15)
+    layout = sticker_cfg.get("landscape") or {}
+    default_size = layout.get("size_percent", 15)
     while True:
         raw_size = _prompt_with_default(
             "Sticker size as % of image's longer side",
@@ -47,7 +48,7 @@ def _prompt_sticker_options(sticker_cfg):
             pass
         print("❌ Enter a number between 1 and 100.")
 
-    default_pos = sticker_cfg.get("position", "middle")
+    default_pos = layout.get("position", "bottom-middle")
     while True:
         raw_pos = _prompt_with_default("Sticker position — left / middle / right", default_pos)
         position = normalize_position(raw_pos)
@@ -90,8 +91,11 @@ def main():
             sticker_cfg["path"] = str(sticker_path.relative_to(SCRIPT_DIR))
         except ValueError:
             sticker_cfg["path"] = str(sticker_path)
-        sticker_cfg["size_percent"] = size_percent
-        sticker_cfg["position"] = position
+        # The CLI asks once and applies the answer to both orientations.
+        for orientation in ("landscape", "portrait"):
+            sticker_cfg.setdefault(orientation, {})
+            sticker_cfg[orientation]["size_percent"] = size_percent
+            sticker_cfg[orientation]["position"] = position
 
     if not (text_cfg.get("enabled") and text_cfg.get("content")) and not sticker_cfg.get("enabled"):
         print("❌ Nothing to apply. Enable text and/or sticker watermark.")
