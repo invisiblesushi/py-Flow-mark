@@ -18,6 +18,7 @@ from flowmark import (
     default_workers,
     estimate_export_savings,
     export_resize_label,
+    image_orientation,
     format_savings_estimate,
     load_config,
     normalize_opacity,
@@ -35,9 +36,15 @@ from flowmark.cloud import (
     parse_album_id,
 )
 
-from .preview import find_folder_preview_images, fit_for_display, make_placeholder
+from .preview import (
+    draw_aspect_overlays,
+    find_folder_preview_images,
+    fit_for_display,
+    make_placeholder,
+)
 from .theme import (
     ACCENT,
+    ASPECT_GUIDES,
     ACCENT_HOVER,
     BG,
     BORDER,
@@ -55,6 +62,7 @@ from .theme import (
     TEXT,
     TRBL_LABELS,
     TRBL_SIDES,
+    oriented_guide,
 )
 from .widgets import Accordion, PathChip, PillGroup, PositionGrid
 
@@ -535,6 +543,8 @@ class FlowMarkApp(ctk.CTk):
             self._write_layout_vars(self._layouts[new])
             for btn in self._copy_layout_buttons:
                 btn.configure(text=self._copy_layout_label())
+            for btn, guide in getattr(self, "_aspect_guide_buttons", {}).values():
+                btn.configure(text=oriented_guide(guide, new)[0])
         self._last_preview_rgba = None
         self.schedule_preview()
 
@@ -880,6 +890,34 @@ class FlowMarkApp(ctk.CTk):
         self.slider_preview_scale.pack(fill="x", padx=14, pady=(4, 0))
         self.slider_preview_scale.set(65)
         self._disable_slider_mousewheel(self.slider_preview_scale)
+
+        guide_row = ctk.CTkFrame(parent, fg_color="transparent")
+        guide_row.pack(fill="x", padx=14, pady=(8, 0))
+        ctk.CTkLabel(guide_row, text="Crop guides", text_color=MUTED).pack(side="left", padx=(0, 8))
+        self.var_aspect_guides = {}
+        self._aspect_guide_buttons = {}
+        for guide in ASPECT_GUIDES:
+            key, color = guide[0], guide[3]
+            var = ctk.BooleanVar(value=False)
+            self.var_aspect_guides[key] = var
+            btn = ctk.CTkButton(
+                guide_row, text=oriented_guide(guide, self._layout_orientation)[0],
+                width=64, height=28, corner_radius=14,
+                font=ctk.CTkFont(size=12), border_width=2,
+            )
+            self._aspect_guide_buttons[key] = (btn, guide)
+            btn.configure(command=lambda v=var: v.set(not v.get()))
+            btn.pack(side="left", padx=3)
+
+            def paint(*_, b=btn, v=var, c=color):
+                if v.get():
+                    b.configure(fg_color=PANEL, border_color=c, text_color=c, hover_color=BORDER)
+                else:
+                    b.configure(fg_color=PANEL, border_color=BORDER, text_color=MUTED, hover_color=BORDER)
+
+            var.trace_add("write", paint)
+            var.trace_add("write", lambda *_: self._redraw_cached_preview())
+            paint()
 
         self.preview_canvas = ctk.CTkFrame(parent, fg_color=PANEL, corner_radius=12)
         self.preview_canvas.pack(fill="both", expand=True, padx=14, pady=12)
@@ -1232,9 +1270,29 @@ class FlowMarkApp(ctk.CTk):
         scale = max(0.4, min(1.5, scale))
         return max(32, int(w * scale)), max(32, int(h * scale))
 
+    def _active_aspect_guides(self, orientation):
+        """Enabled guides rotated to match the photo (portrait or landscape)."""
+        enabled = getattr(self, "var_aspect_guides", {})
+        out = []
+        for guide in ASPECT_GUIDES:
+            var = enabled.get(guide[0])
+            if var is not None and var.get():
+                _button, label, rw, rh, color = oriented_guide(guide, orientation)
+                out.append((label, rw, rh, color))
+        return out
+
+    def _redraw_cached_preview(self):
+        if self._last_preview_rgba is not None:
+            self._show_preview_image(self._last_preview_rgba)
+        else:
+            self.schedule_preview()
+
     def _show_preview_image(self, rgba_image):
         max_w, max_h = self._preview_fit_box()
         display = fit_for_display(rgba_image.convert("RGBA"), max_w, max_h)
+        # Guides are drawn at display size so lines and labels stay crisp; preview only.
+        orientation = image_orientation(display.width, display.height)
+        display = draw_aspect_overlays(display, self._active_aspect_guides(orientation))
 
         scaling = self._ui_scaling()
         ctk_w = max(1, int(round(display.width / scaling)))

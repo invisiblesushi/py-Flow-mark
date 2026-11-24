@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from .theme import IMAGE_EXTS, PREVIEW_WORK_MAX
 
@@ -76,3 +76,77 @@ def find_folder_preview_images(folder):
         except Exception:
             continue
     return landscape, portrait
+
+
+def _hex_rgb(color):
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def centered_ratio_box(width, height, ratio_w, ratio_h):
+    """Largest centered (x0, y0, x1, y1) box with ratio_w:ratio_h inside width x height."""
+    target = ratio_w / float(ratio_h)
+    if width / float(height) > target:
+        box_h = height
+        box_w = int(round(height * target))
+    else:
+        box_w = width
+        box_h = int(round(width / target))
+    x0 = (width - box_w) // 2
+    y0 = (height - box_h) // 2
+    return x0, y0, x0 + box_w, y0 + box_h
+
+
+def draw_aspect_overlays(image, guides):
+    """
+    Draw crop-guide frames on a copy of the (display-sized) preview image.
+
+    guides: iterable of (label, ratio_w, ratio_h, color_hex).
+    With a single guide, the area outside it is dimmed to show the crop.
+    """
+    guides = list(guides)
+    if not guides:
+        return image
+    out = image.convert("RGBA")
+    w, h = out.size
+    layer = Image.new("RGBA", out.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    line = max(2, round(min(w, h) / 250))
+    font_size = max(11, round(min(w, h) / 32))
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except OSError:
+        font = ImageFont.load_default()
+
+    boxes = [(label, centered_ratio_box(w, h, rw, rh), _hex_rgb(color)) for label, rw, rh, color in guides]
+
+    if len(boxes) == 1:
+        x0, y0, x1, y1 = boxes[0][1]
+        shade = (0, 0, 0, 140)
+        for rect in ((0, 0, w, y0), (0, y1, w, h), (0, y0, x0, y1), (x1, y0, w, y1)):
+            if rect[2] > rect[0] and rect[3] > rect[1]:
+                draw.rectangle((rect[0], rect[1], rect[2] - 1, rect[3] - 1), fill=shade)
+
+    for _label, (x0, y0, x1, y1), rgb in boxes:
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=rgb + (255,), width=line)
+
+    # Labels go at each frame's top-left; push a label down until it clears
+    # every label already placed (frames often share the same top edge).
+    pad = max(3, font_size // 4)
+    placed = []
+    for label, (x0, y0, _x1, _y1), rgb in boxes:
+        tb = draw.textbbox((0, 0), label, font=font)
+        tw, th = tb[2] - tb[0], tb[3] - tb[1]
+        lx = x0 + line + pad
+        ly = y0 + line + pad
+        while True:
+            rect = (lx - pad, ly - pad, lx + tw + pad, ly + th + pad)
+            hit = next((r for r in placed if rect[0] < r[2] and r[0] < rect[2]
+                        and rect[1] < r[3] and r[1] < rect[3]), None)
+            if hit is None:
+                break
+            ly = hit[3] + pad + 2
+        placed.append(rect)
+        draw.rectangle(rect, fill=(0, 0, 0, 170))
+        draw.text((lx - tb[0], ly - tb[1]), label, font=font, fill=rgb + (255,))
+    return Image.alpha_composite(out, layer)
